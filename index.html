@@ -1,273 +1,93 @@
 from pathlib import Path
-import zipfile, textwrap, os
+import zipfile, shutil, textwrap, os
 
-root = Path("/mnt/data/marketplace_demo")
-(root/"public").mkdir(parents=True, exist_ok=True)
+root=Path("/mnt/data/dadashop")
+if root.exists(): shutil.rmtree(root)
+(root/"public").mkdir(parents=True)
 
-files = {
-"package.json": r'''{
-  "name": "az-marketplace-demo",
-  "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "scripts": {"start":"node server.js"},
-  "dependencies": {"express":"^4.21.2","better-sqlite3":"^11.8.1","bcryptjs":"^2.4.3","jsonwebtoken":"^9.0.2","multer":"^1.4.5-lts.1","dotenv":"^16.4.7"}
-}''',
-
-".env.example": r'''PORT=3000
-JWT_SECRET=change-this-secret
-# Add real payment provider credentials here when you connect PayPal/Stripe.
+files={
+"package.json":'''{"name":"dadashop","version":"1.0.0","private":true,"type":"module","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.21.2","better-sqlite3":"^11.8.1","bcryptjs":"^2.4.3","jsonwebtoken":"^9.0.2","multer":"^1.4.5-lts.1","dotenv":"^16.4.7"}}''',
+".env.example":'''PORT=3000
+JWT_SECRET=change-me
+# Real payment providers go here:
 # PAYPAL_CLIENT_ID=
 # PAYPAL_CLIENT_SECRET=
 # STRIPE_SECRET_KEY=
 ''',
-
-"server.js": r'''import express from "express";
+"server.js":'''import express from "express";
 import path from "path";
-import { fileURLToPath } from "url";
+import {fileURLToPath} from "url";
 import dotenv from "dotenv";
+import Database from "better-sqlite3";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import Database from "better-sqlite3";
 import multer from "multer";
 import fs from "fs";
-
 dotenv.config();
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const app = express();
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || "dev-secret-change-me";
-
-fs.mkdirSync(path.join(__dirname, "public/uploads"), { recursive: true });
-
-const db = new Database(path.join(__dirname, "marketplace.db"));
-db.pragma("journal_mode = WAL");
-db.exec(`
-CREATE TABLE IF NOT EXISTS users(
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- name TEXT NOT NULL,
- email TEXT UNIQUE NOT NULL,
- password TEXT NOT NULL,
- wallet_cents INTEGER NOT NULL DEFAULT 0,
- created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS products(
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- seller_id INTEGER NOT NULL,
- title TEXT NOT NULL,
- description TEXT NOT NULL,
- price_cents INTEGER NOT NULL,
- category TEXT NOT NULL,
- image TEXT,
- sold INTEGER NOT NULL DEFAULT 0,
- created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS orders(
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- buyer_id INTEGER NOT NULL,
- seller_id INTEGER NOT NULL,
- product_id INTEGER NOT NULL,
- amount_cents INTEGER NOT NULL,
- status TEXT NOT NULL DEFAULT 'paid',
- created_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-`);
-
-const upload = multer({ dest: path.join(__dirname, "public/uploads/") });
-app.use(express.json());
-app.use(express.urlencoded({extended:true}));
-app.use(express.static(path.join(__dirname, "public")));
-
-function auth(req,res,next){
-  const h=req.headers.authorization||"";
-  const token=h.startsWith("Bearer ")?h.slice(7):null;
-  if(!token) return res.status(401).json({error:"Connexion requise"});
-  try { req.user=jwt.verify(token,JWT_SECRET); next(); }
-  catch { res.status(401).json({error:"Session invalide"}); }
-}
-
-app.post("/api/register", async (req,res)=>{
-  const {name,email,password}=req.body;
-  if(!name||!email||!password||password.length<6) return res.status(400).json({error:"Nom, email et mot de passe (6 caractères minimum) requis"});
-  try{
-    const hash=await bcrypt.hash(password,12);
-    const info=db.prepare("INSERT INTO users(name,email,password) VALUES(?,?,?)").run(name,email.toLowerCase(),hash);
-    const user={id:Number(info.lastInsertRowid),name,email:email.toLowerCase()};
-    const token=jwt.sign(user,JWT_SECRET,{expiresIn:"7d"});
-    res.json({token,user});
-  }catch(e){res.status(400).json({error:"Cet email est déjà utilisé"});}
-});
-
-app.post("/api/login", async (req,res)=>{
-  const {email,password}=req.body;
-  const u=db.prepare("SELECT * FROM users WHERE email=?").get((email||"").toLowerCase());
-  if(!u || !(await bcrypt.compare(password||"",u.password))) return res.status(401).json({error:"Email ou mot de passe incorrect"});
-  const user={id:u.id,name:u.name,email:u.email};
-  res.json({token:jwt.sign(user,JWT_SECRET,{expiresIn:"7d"}),user});
-});
-
-app.get("/api/me",auth,(req,res)=>{
-  const u=db.prepare("SELECT id,name,email,wallet_cents FROM users WHERE id=?").get(req.user.id);
-  res.json(u);
-});
-
-app.get("/api/products",(req,res)=>{
-  const q=(req.query.q||"").trim();
-  const rows=q ? db.prepare(`SELECT p.*,u.name seller FROM products p JOIN users u ON u.id=p.seller_id WHERE p.sold=0 AND (p.title LIKE ? OR p.description LIKE ?) ORDER BY p.id DESC`).all(`%${q}%`,`%${q}%`)
-               : db.prepare(`SELECT p.*,u.name seller FROM products p JOIN users u ON u.id=p.seller_id WHERE p.sold=0 ORDER BY p.id DESC`).all();
-  res.json(rows);
-});
-
-app.post("/api/products",auth,upload.single("image"),(req,res)=>{
-  const {title,description,price,category}=req.body;
-  const cents=Math.round(Number(price)*100);
-  if(!title||!description||!category||!Number.isFinite(cents)||cents<=0) return res.status(400).json({error:"Informations d'annonce invalides"});
-  const image=req.file?"/uploads/"+req.file.filename:"";
-  const info=db.prepare("INSERT INTO products(seller_id,title,description,price_cents,category,image) VALUES(?,?,?,?,?,?)")
-    .run(req.user.id,title,description,cents,category,image);
-  res.json({id:Number(info.lastInsertRowid)});
-});
-
-/*
-  DEMO CHECKOUT:
-  This endpoint creates an order using the logged-in buyer's wallet balance.
-  It does NOT charge a real card. For production, replace this part with a
-  verified PayPal/Stripe checkout and webhook, then credit the seller only
-  after the provider confirms payment.
-*/
-app.post("/api/buy/:id",auth,(req,res)=>{
-  const product=db.prepare("SELECT * FROM products WHERE id=? AND sold=0").get(req.params.id);
-  if(!product) return res.status(404).json({error:"Article indisponible"});
-  if(product.seller_id===req.user.id) return res.status(400).json({error:"Tu ne peux pas acheter ta propre annonce"});
-  const buyer=db.prepare("SELECT * FROM users WHERE id=?").get(req.user.id);
-  if(buyer.wallet_cents<product.price_cents) return res.status(402).json({error:"Solde portefeuille insuffisant (mode démo)"});
-  const tx=db.transaction(()=>{
-    db.prepare("UPDATE users SET wallet_cents=wallet_cents-? WHERE id=?").run(product.price_cents,buyer.id);
-    db.prepare("UPDATE users SET wallet_cents=wallet_cents+? WHERE id=?").run(product.price_cents,product.seller_id);
-    db.prepare("UPDATE products SET sold=1 WHERE id=?").run(product.id);
-    return db.prepare("INSERT INTO orders(buyer_id,seller_id,product_id,amount_cents) VALUES(?,?,?,?)").run(buyer.id,product.seller_id,product.id,product.price_cents);
-  });
-  const info=tx();
-  res.json({ok:true,orderId:Number(info.lastInsertRowid)});
-});
-
-app.get("/api/orders",auth,(req,res)=>{
-  const rows=db.prepare(`SELECT o.*,p.title,p.image,u.name seller FROM orders o JOIN products p ON p.id=o.product_id JOIN users u ON u.id=o.seller_id WHERE o.buyer_id=? ORDER BY o.id DESC`).all(req.user.id);
-  res.json(rows);
-});
-
-app.post("/api/wallet/demo-credit",auth,(req,res)=>{
-  const cents=Math.round(Number(req.body.amount)*100);
-  if(!Number.isFinite(cents)||cents<=0||cents>10000000) return res.status(400).json({error:"Montant invalide"});
-  db.prepare("UPDATE users SET wallet_cents=wallet_cents+? WHERE id=?").run(cents,req.user.id);
-  res.json({ok:true});
-});
-
+const __dirname=path.dirname(fileURLToPath(import.meta.url)),app=express();
+const db=new Database(path.join(__dirname,"dadashop.db"));
+db.exec(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,email TEXT UNIQUE,password TEXT,wallet INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY AUTOINCREMENT,seller INTEGER,title TEXT,description TEXT,price INTEGER,category TEXT,image TEXT,sold INTEGER DEFAULT 0,created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY AUTOINCREMENT,buyer INTEGER,seller INTEGER,product INTEGER,amount INTEGER,status TEXT DEFAULT 'paid',created TEXT DEFAULT CURRENT_TIMESTAMP);`);
+fs.mkdirSync(path.join(__dirname,"public/uploads"),{recursive:true});
+const upload=multer({dest:path.join(__dirname,"public/uploads")});
+app.use(express.json());app.use(express.urlencoded({extended:true}));app.use(express.static(path.join(__dirname,"public")));
+const secret=process.env.JWT_SECRET||"dadashop-dev-secret";
+function auth(req,res,next){const t=(req.headers.authorization||"").replace("Bearer ","");try{req.user=jwt.verify(t,secret);next()}catch{res.status(401).json({error:"AUTH_REQUIRED"})}}
+app.post("/api/register",async(req,res)=>{const {name,email,password}=req.body;if(!name||!email||!password||password.length<6)return res.status(400).json({error:"Informations invalides"});try{const p=await bcrypt.hash(password,12),r=db.prepare("INSERT INTO users(name,email,password) VALUES(?,?,?)").run(name,email.toLowerCase(),p),u={id:+r.lastInsertRowid,name,email:email.toLowerCase()};res.json({token:jwt.sign(u,secret,{expiresIn:"7d"}),user:u})}catch{res.status(400).json({error:"Email déjà utilisé"})}});
+app.post("/api/login",async(req,res)=>{const u=db.prepare("SELECT * FROM users WHERE email=?").get((req.body.email||"").toLowerCase());if(!u||!(await bcrypt.compare(req.body.password||"",u.password)))return res.status(401).json({error:"Email ou mot de passe incorrect"});const x={id:u.id,name:u.name,email:u.email};res.json({token:jwt.sign(x,secret,{expiresIn:"7d"}),user:x})});
+app.get("/api/me",auth,(req,res)=>res.json(db.prepare("SELECT id,name,email,wallet FROM users WHERE id=?").get(req.user.id)));
+app.get("/api/products",(req,res)=>{const q=(req.query.q||"").trim();const a=q?db.prepare("SELECT p.*,u.name seller FROM products p JOIN users u ON u.id=p.seller WHERE p.sold=0 AND (p.title LIKE ? OR p.description LIKE ?) ORDER BY p.id DESC").all("%"+q+"%","%"+q+"%"):db.prepare("SELECT p.*,u.name seller FROM products p JOIN users u ON u.id=p.seller WHERE p.sold=0 ORDER BY p.id DESC").all();res.json(a)});
+app.post("/api/products",auth,upload.single("image"),(req,res)=>{const c=Number(req.body.price)*100;if(!req.body.title||!req.body.description||!Number.isFinite(c)||c<=0)return res.status(400).json({error:"Annonce invalide"});const img=req.file?"/uploads/"+req.file.filename:"";const r=db.prepare("INSERT INTO products(seller,title,description,price,category,image) VALUES(?,?,?,?,?,?)").run(req.user.id,req.body.title,req.body.description,Math.round(c),req.body.category||"Autre",img);res.json({id:+r.lastInsertRowid})});
+app.post("/api/buy/:id",auth,(req,res)=>{const p=db.prepare("SELECT * FROM products WHERE id=? AND sold=0").get(req.params.id),b=db.prepare("SELECT * FROM users WHERE id=?").get(req.user.id);if(!p)return res.status(404).json({error:"Article indisponible"});if(p.seller===b.id)return res.status(400).json({error:"Impossible d'acheter sa propre annonce"});if(b.wallet<p.price)return res.status(402).json({error:"Solde insuffisant"});const tx=db.transaction(()=>{db.prepare("UPDATE users SET wallet=wallet-? WHERE id=?").run(p.price,b.id);db.prepare("UPDATE users SET wallet=wallet+? WHERE id=?").run(p.price,p.seller);db.prepare("UPDATE products SET sold=1 WHERE id=?").run(p.id);return db.prepare("INSERT INTO orders(buyer,seller,product,amount) VALUES(?,?,?,?)").run(b.id,p.seller,p.id,p.price)});const r=tx();res.json({ok:true,order:+r.lastInsertRowid})});
+app.get("/api/orders",auth,(req,res)=>res.json(db.prepare("SELECT o.*,p.title,p.image FROM orders o JOIN products p ON p.id=o.product WHERE o.buyer=? ORDER BY o.id DESC").all(req.user.id)));
+app.post("/api/wallet/demo",auth,(req,res)=>{const n=Math.round(Number(req.body.amount)*100);if(n<=0||n>10000000)return res.status(400).json({error:"Montant invalide"});db.prepare("UPDATE users SET wallet=wallet+? WHERE id=?").run(n,req.user.id);res.json({ok:true})});
 app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"public/index.html")));
-app.listen(PORT,()=>console.log(`Marketplace: http://localhost:${PORT}`));
+app.listen(process.env.PORT||3000,()=>console.log("DadaShop lancé"));
 ''',
-
-"public/index.html": r'''<!doctype html>
-<html lang="fr">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Vestiq — Marketplace</title>
-<link rel="stylesheet" href="/style.css">
-</head>
-<body>
-<header>
-  <div class="brand">Vestiq<span>•</span></div>
-  <div class="search"><input id="search" placeholder="Rechercher un article…"><button onclick="loadProducts()">⌕</button></div>
-  <select id="lang" onchange="setLang(this.value)"><option value="fr">Français</option><option value="ru">Русский</option><option value="az">Azərbaycan</option></select>
-  <button id="accountBtn" class="ghost" onclick="openAuth()">Se connecter</button>
-</header>
-
-<nav>
-  <button onclick="showPage('home')">Accueil</button>
-  <button onclick="showPage('sell')">＋ Vendre</button>
-  <button onclick="showPage('orders')">📦 Commandes</button>
-  <button onclick="showPage('wallet')">💳 Portefeuille</button>
-</nav>
-
+"public/index.html":'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DadaShop</title><meta name="description" content="DadaShop — achète et vends simplement."><link rel="stylesheet" href="/style.css"></head><body>
+<header class="top"><div class="logo">Dada<span>Shop</span></div><div class="search"><input id="q" placeholder="Rechercher mode, téléphone, maison..."><button onclick="load()">⌕</button></div><button class="lang" onclick="cycleLang()" id="lang">FR</button><button class="account" id="account" onclick="auth()">Se connecter</button></header>
+<nav><button onclick="page('home')">Accueil</button><button onclick="page('browse')">Explorer</button><button onclick="page('sell')">Vendre</button><button onclick="page('orders')">Commandes</button><button onclick="page('wallet')">Portefeuille</button></nav>
 <main>
-<section id="home" class="page active">
-  <div class="hero"><div><p class="eyebrow">LE NOUVEAU MARCHÉ</p><h1>Achète. Vends.<br><em>Simplement.</em></h1><p>Une marketplace moderne pour vendre tes objets et trouver de bonnes affaires.</p></div></div>
-  <div class="toolbar"><h2>Dernières annonces</h2></div>
-  <div id="products" class="grid"></div>
-</section>
-
-<section id="sell" class="page">
-  <div class="card form"><h2>Publier une annonce</h2><form id="sellForm" enctype="multipart/form-data">
-    <input name="title" placeholder="Titre" required>
-    <textarea name="description" placeholder="Description" required></textarea>
-    <div class="two"><input name="price" type="number" step="0.01" min="0.01" placeholder="Prix (€)" required>
-    <select name="category"><option>Mode</option><option>Électronique</option><option>Maison</option><option>Sport</option><option>Autre</option></select></div>
-    <input name="image" type="file" accept="image/*">
-    <button class="primary">Publier</button>
-  </form></div>
-</section>
-
-<section id="orders" class="page"><div class="card"><h2>Mes commandes</h2><div id="ordersList"></div></div></section>
-
-<section id="wallet" class="page"><div class="card"><h2>Mon portefeuille</h2><div class="balance" id="balance">—</div><p>Mode démo : ajoute un crédit fictif pour tester le parcours d'achat.</p><form id="creditForm"><input name="amount" type="number" step="0.01" min="1" placeholder="Montant"><button class="primary">Ajouter au portefeuille</button></form><hr><p><b>Paiements réels :</b> connecte PayPal/Stripe côté serveur avant de mettre le site en production.</p></div></section>
+<section id="home" class="page active"><div class="hero"><div><div class="pill">LA NOUVELLE MARKETPLACE</div><h1>Ton style.<br><i>Ton shop.</i><br>Ton Dada.</h1><p>Achète des pièces uniques et vends ce dont tu n'as plus besoin.</p><button class="cta" onclick="page('browse')">Explorer les annonces →</button></div><div class="hero-card"><div class="floating f1">✨ Nouveau</div><div class="fashion"></div><div class="priceTag">à partir de 8 €</div></div></div><div class="sectionHead"><div><small>À DÉCOUVRIR</small><h2>Les dernières annonces</h2></div><button onclick="page('browse')">Tout voir →</button></div><div id="products" class="grid"></div></section>
+<section id="browse" class="page"><div class="sectionHead"><div><small>MARKETPLACE</small><h2>Explorer</h2></div></div><div id="products2" class="grid"></div></section>
+<section id="sell" class="page"><div class="panel"><small>VENDRE</small><h2>Publier une annonce</h2><form id="sellForm"><input name="title" placeholder="Titre de l'article" required><textarea name="description" placeholder="Décris ton article..." required></textarea><div class="row"><input name="price" type="number" min=".01" step=".01" placeholder="Prix (€)" required><select name="category"><option>Mode</option><option>Électronique</option><option>Maison</option><option>Sport</option><option>Accessoires</option><option>Autre</option></select></div><input name="image" type="file" accept="image/*"><button class="cta">Publier l'annonce</button></form></div></section>
+<section id="orders" class="page"><div class="panel"><small>ACHATS</small><h2>Mes commandes</h2><div id="ordersList"></div></div></section>
+<section id="wallet" class="page"><div class="panel wallet"><small>MON DADA WALLET</small><h2>Portefeuille</h2><div id="bal">0,00 €</div><p>Solde disponible</p><form id="credit"><input name="amount" type="number" min="1" step=".01" placeholder="Ajouter un montant (démo)"><button class="cta">Ajouter</button></form><div class="notice">Les vrais paiements carte/PayPal nécessitent la connexion de comptes marchands et de clés serveur.</div></div></section>
 </main>
+<div id="modal" class="modal hide"><div class="modalBox"><button class="x" onclick="closeAuth()">×</button><h2 id="authTitle">Bienvenue</h2><form id="authForm"><input id="name" placeholder="Ton prénom" class="hideInput"><input id="email" type="email" placeholder="Email" required><input id="pass" type="password" placeholder="Mot de passe" required><button class="cta">Continuer</button></form><p id="switch">Pas encore de compte ? <a onclick="toggle()">Créer un compte</a></p><div id="msg"></div></div></div><div id="toast"></div><script src="/app.js"></script></body></html>''',
+"public/style.css":'''@import url("https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=Playfair+Display:ital,wght@0,700;1,700&display=swap");:root{--ink:#181818;--muted:#777;--cream:#f7f5ef;--white:#fff;--purple:#7251d7;--line:#e8e5de}*{box-sizing:border-box}body{margin:0;background:var(--cream);color:var(--ink);font-family:"DM Sans",sans-serif}.top{height:78px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:22px;padding:0 5%;position:sticky;top:0;z-index:8}.logo{font-size:27px;font-weight:800;letter-spacing:-1.7px}.logo span{color:var(--purple)}.search{height:44px;max-width:600px;flex:1;background:#f4f2ed;border-radius:14px;display:flex}.search input{flex:1;border:0;background:none;outline:0;padding:0 17px;font:inherit}.search button{border:0;background:none;font-size:23px;padding:0 16px}.lang,.account{border:1px solid var(--line);background:#fff;border-radius:12px;padding:10px 14px;font-weight:700}.account{background:#181818;color:#fff}nav{height:58px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:7px;padding:0 5%}nav button{border:0;background:none;padding:10px 15px;font-weight:700;border-radius:10px;cursor:pointer}nav button:hover{background:#f1edff}main{max-width:1200px;margin:auto;padding:30px 5% 80px}.page{display:none}.page.active{display:block}.hero{min-height:430px;border-radius:30px;padding:48px 55px;background:linear-gradient(120deg,#e6ddff,#f6e6e9 55%,#dceeff);display:flex;justify-content:space-between;overflow:hidden}.pill,small{font-size:11px;letter-spacing:2px;font-weight:800;color:#6e61a0}.hero h1{font-size:68px;line-height:.92;letter-spacing:-4px;margin:15px 0}.hero h1 i{font-family:"Playfair Display";color:var(--purple)}.hero p{font-size:17px;color:#555;max-width:510px;line-height:1.6}.cta{border:0;background:#181818;color:#fff;border-radius:13px;padding:14px 20px;font-weight:800;cursor:pointer}.hero-card{width:40%;min-width:280px;position:relative}.fashion{position:absolute;inset:35px 15px 10px;background:linear-gradient(145deg,#f9f7f2,#d9c7ff);border-radius:28px;box-shadow:0 25px 45px #0002}.floating,.priceTag{position:absolute;background:#fff;padding:12px 16px;border-radius:13px;box-shadow:0 10px 25px #0002;font-weight:700}.f1{top:20px;right:0}.priceTag{bottom:0;left:0}.sectionHead{display:flex;justify-content:space-between;align-items:end;margin:42px 0 18px}.sectionHead h2{font-size:30px;margin:5px 0}.sectionHead button{border:0;background:none;font-weight:800}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:18px}.product{background:#fff;border:1px solid var(--line);border-radius:19px;overflow:hidden;transition:.2s}.product:hover{transform:translateY(-3px);box-shadow:0 15px 35px #0000000d}.product img{width:100%;aspect-ratio:1;object-fit:cover;background:#eee}.body{padding:14px}.price{font-weight:800;font-size:18px}.body h3{margin:7px 0;font-size:15px}.muted{font-size:12px;color:var(--muted)}.buy{margin-top:10px;width:100%;background:var(--purple)}.panel{max-width:720px;margin:30px auto;background:#fff;border:1px solid var(--line);border-radius:25px;padding:30px}.panel h2{font-size:35px;margin:6px 0 25px}.panel form{display:grid;gap:13px}input,textarea,select{font:inherit;padding:14px;border:1px solid var(--line);border-radius:12px;width:100%}textarea{min-height:140px}.row{display:grid;grid-template-columns:1fr 1fr;gap:13px}.wallet #bal{font-size:55px;font-weight:800;margin-top:25px}.notice{margin-top:25px;padding:15px;background:#f4f0ff;border-radius:13px;font-size:13px}.modal{position:fixed;inset:0;background:#0008;display:grid;place-items:center;z-index:20}.hide{display:none}.modalBox{width:min(430px,92%);background:#fff;border-radius:24px;padding:30px;position:relative}.modalBox form{display:grid;gap:12px}.modalBox a{color:var(--purple);font-weight:800;cursor:pointer}.x{position:absolute;right:15px;top:12px;border:0;background:none;font-size:28px}.hideInput{display:none}#toast{position:fixed;bottom:22px;right:22px;background:#181818;color:#fff;padding:14px 18px;border-radius:13px;display:none;z-index:30}.order{padding:16px 0;border-bottom:1px solid var(--line)}@media(max-width:850px){.top{height:auto;flex-wrap:wrap;padding:12px 4%;gap:10px}.search{order:5;flex-basis:100%}nav{overflow:auto;padding:0 4%}.hero{padding:35px 28px}.hero h1{font-size:50px}.hero-card{display:none}.grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:500px){.grid{gap:10px}.hero{border-radius:20px}.hero h1{font-size:42px}.row{grid-template-columns:1fr}main{padding:20px 4%}.account{padding:9px 10px}.logo{font-size:23px}}''',
+"public/app.js":'''let token=localStorage.getItem("dada_token")||"",reg=false,lang=localStorage.getItem("dada_lang")||"fr";const $=x=>document.getElementById(x);const euro=c=>new Intl.NumberFormat(lang==="ru"?"ru-RU":lang==="az"?"az-AZ":"fr-FR",{style:"currency",currency:"EUR"}).format(c/100);
+async function api(u,o={}){o.headers=o.headers||{};if(token)o.headers.Authorization="Bearer "+token;let r=await fetch(u,o),d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||"Erreur");return d}
+function page(id){document.querySelectorAll(".page").forEach(x=>x.classList.remove("active"));$(id).classList.add("active");if(id==="orders")orders();if(id==="wallet")me();if(id==="sell"&&!token)auth()}
+function toast(t){$("toast").textContent=t;$("toast").style.display="block";setTimeout(()=>$("toast").style.display="none",2300)}
+function safe(s){return String(s).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]))}
+async function load(){let q=encodeURIComponent($("q").value),p=await api("/api/products?q="+q);let html=p.map(x=>`<article class="product"><img src="${x.image||"https://images.unsplash.com/photo-1529139574466-a303027c1d8b?auto=format&fit=crop&w=700&q=80"}"><div class="body"><div class="price">${euro(x.price)}</div><h3>${safe(x.title)}</h3><div class="muted">${safe(x.category)} · ${safe(x.seller)}</div><button class="cta buy" onclick="buy(${x.id})">Acheter</button></div></article>`).join("");$("products").innerHTML=html||"<p>Aucune annonce.</p>";$("products2").innerHTML=html||"<p>Aucune annonce.</p>"}
+function auth(){$("modal").classList.remove("hide")}
+function closeAuth(){$("modal").classList.add("hide")}
+function toggle(){reg=!reg;$("authTitle").textContent=reg?"Créer ton compte":"Bienvenue";$("name").style.display=reg?"block":"none";$("switch").innerHTML=reg?'Déjà un compte ? <a onclick="toggle()">Se connecter</a>':'Pas encore de compte ? <a onclick="toggle()">Créer un compte</a>'}
+$("authForm").onsubmit=async e=>{e.preventDefault();try{let b={email:$("email").value,password:$("pass").value};if(reg)b.name=$("name").value;let d=await api(reg?"/api/register":"/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});token=d.token;localStorage.setItem("dada_token",token);closeAuth();$("account").textContent="Mon compte";toast("Connexion réussie");me()}catch(e){$("msg").textContent=e.message}}
+$("sellForm").onsubmit=async e=>{e.preventDefault();if(!token)return auth();try{let r=await fetch("/api/products",{method:"POST",headers:{Authorization:"Bearer "+token},body:new FormData(e.target)}),d=await r.json();if(!r.ok)throw Error(d.error);e.target.reset();toast("Annonce publiée");page("home");load()}catch(x){toast(x.message)}}
+async function buy(id){if(!token)return auth();try{let d=await api("/api/buy/"+id,{method:"POST"});toast("Achat confirmé #"+d.order);load();orders()}catch(e){toast(e.message)}}
+async function me(){if(!token)return;try{let u=await api("/api/me");$("bal").textContent=euro(u.wallet)}catch{}}
+async function orders(){if(!token){$("ordersList").innerHTML="<p>Connecte-toi pour voir tes commandes.</p>";return}let a=await api("/api/orders");$("ordersList").innerHTML=a.length?a.map(o=>`<div class="order"><b>${safe(o.title)}</b><br>${euro(o.amount)} · ${safe(o.status)}</div>`).join(""):"<p>Aucune commande.</p>"}
+$("credit").onsubmit=async e=>{e.preventDefault();try{await api("/api/wallet/demo",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({amount:e.target.amount.value})});e.target.reset();me();toast("Portefeuille mis à jour")}catch(x){toast(x.message)}}
+function cycleLang(){lang=lang==="fr"?"ru":lang==="ru"?"az":"fr";localStorage.setItem("dada_lang",lang);$("lang").textContent=lang.toUpperCase();toast(lang==="ru"?"Русский":lang==="az"?"Azərbaycan":"Français")}
+$("lang").textContent=lang.toUpperCase();if(token)$("account").textContent="Mon compte";load();if(token)me();''',
+"README.md":'''# DadaShop
+Projet marketplace responsive avec interface sans code visible pour le visiteur.
 
-<div id="authModal" class="modal hidden"><div class="modalBox"><button class="close" onclick="closeAuth()">×</button><h2 id="authTitle">Connexion</h2><form id="authForm"><input id="authName" placeholder="Nom" style="display:none"><input id="authEmail" type="email" placeholder="Email" required><input id="authPassword" type="password" placeholder="Mot de passe" required><button class="primary">Continuer</button></form><p id="authSwitch">Pas encore de compte ? <a onclick="toggleAuth()">Créer un compte</a></p><div id="authMsg"></div></div></div>
-<div id="toast"></div>
-<script src="/app.js"></script>
-</body></html>''',
+Lancer:
+npm install
+npm start
+Puis http://localhost:3000
 
-"public/style.css": r''':root{--ink:#171717;--muted:#777;--bg:#f7f6f2;--card:#fff;--accent:#7c3aed;--accent2:#a855f7;--line:#e8e5df}*{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;background:var(--bg);color:var(--ink)}header{height:76px;background:#fff;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:18px;padding:0 5%;position:sticky;top:0;z-index:5}.brand{font-size:27px;font-weight:900;letter-spacing:-1.5px}.brand span{color:var(--accent)}.search{display:flex;flex:1;max-width:620px;background:#f3f1ed;border-radius:16px;overflow:hidden}.search input{border:0;background:transparent;padding:14px 17px;outline:0;flex:1;font-size:15px}.search button{border:0;background:transparent;font-size:22px;padding:0 17px}select,.ghost{border:1px solid var(--line);background:#fff;border-radius:12px;padding:10px 13px}.ghost{font-weight:700}nav{display:flex;gap:8px;padding:12px 5%;background:#fff;border-bottom:1px solid var(--line)}nav button{border:0;background:transparent;padding:10px 15px;border-radius:12px;font-weight:700}nav button:hover{background:#f1eeff}main{max-width:1180px;margin:auto;padding:28px 5% 70px}.page{display:none}.page.active{display:block}.hero{border-radius:28px;min-height:290px;padding:45px;background:linear-gradient(120deg,#eadcff,#f9e7f0 55%,#e8f4ff);display:flex;align-items:center;margin-bottom:35px}.hero h1{font-size:52px;line-height:.95;letter-spacing:-3px;margin:8px 0}.hero em{font-style:normal;color:var(--accent)}.eyebrow{font-weight:800;letter-spacing:2px;font-size:12px}.hero p{max-width:560px;color:#555}.toolbar{display:flex;justify-content:space-between}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:18px}.product{background:#fff;border:1px solid var(--line);border-radius:20px;overflow:hidden;box-shadow:0 6px 20px #00000008}.product img{width:100%;aspect-ratio:1;object-fit:cover;background:#eee}.pbody{padding:14px}.price{font-weight:900;font-size:18px}.seller{color:var(--muted);font-size:13px}.buy{width:100%;margin-top:10px}.card{background:#fff;border:1px solid var(--line);border-radius:24px;padding:25px;max-width:720px;margin:auto}.form{display:flex;flex-direction:column}.form form,.card form{display:grid;gap:13px}input,textarea,form select{width:100%;padding:14px;border:1px solid var(--line);border-radius:13px;font:inherit}textarea{min-height:130px;resize:vertical}.two{display:grid;grid-template-columns:1fr 1fr;gap:13px}.primary{background:var(--accent);color:#fff;border:0;border-radius:13px;padding:14px;font-weight:800;cursor:pointer}.balance{font-size:48px;font-weight:900;margin:20px 0}.modal{position:fixed;inset:0;background:#0008;display:grid;place-items:center;z-index:10}.hidden{display:none}.modalBox{width:min(430px,92vw);background:#fff;border-radius:24px;padding:28px;position:relative}.modalBox form{display:grid;gap:12px}.close{position:absolute;right:15px;top:10px;border:0;background:transparent;font-size:28px}.modalBox a{color:var(--accent);font-weight:700;cursor:pointer}.order{padding:14px 0;border-bottom:1px solid var(--line)}#toast{position:fixed;right:20px;bottom:20px;background:#171717;color:white;padding:13px 17px;border-radius:12px;display:none;z-index:20}@media(max-width:850px){header{height:auto;flex-wrap:wrap;padding:12px 4%}.search{order:3;flex-basis:100%;max-width:none}nav{overflow:auto;padding:8px 4%}.grid{grid-template-columns:repeat(2,1fr)}.hero h1{font-size:40px}.hero{min-height:250px;padding:30px}}@media(max-width:500px){.grid{grid-template-columns:1fr 1fr;gap:10px}.hero{border-radius:20px}.hero h1{font-size:34px}.two{grid-template-columns:1fr}main{padding:18px 4%}}''',
-
-"public/app.js": r'''let token=localStorage.getItem("token")||""; let register=false;
-const $=id=>document.getElementById(id);
-const money=c=>new Intl.NumberFormat("fr-FR",{style:"currency",currency:"EUR"}).format(c/100);
-function toast(t){$("toast").textContent=t;$("toast").style.display="block";setTimeout(()=>$("toast").style.display="none",2500)}
-async function api(url,opt={}){opt.headers=opt.headers||{};if(token)opt.headers.Authorization="Bearer "+token;const r=await fetch(url,opt);const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||"Erreur");return d}
-async function loadProducts(){const q=encodeURIComponent($("search").value);const rows=await api("/api/products?q="+q);$("products").innerHTML=rows.length?rows.map(p=>`<article class="product"><img src="${p.image||'https://images.unsplash.com/photo-1521572163474-6864f9cf17ab?auto=format&fit=crop&w=700&q=80'}"><div class="pbody"><div class="price">${money(p.price_cents)}</div><h3>${esc(p.title)}</h3><div class="seller">${esc(p.category)} · ${esc(p.seller)}</div><button class="primary buy" onclick="buy(${p.id})">Acheter</button></div></article>`).join(""):"<p>Aucune annonce pour le moment.</p>"}
-function esc(s){return String(s).replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]))}
-async function buy(id){if(!token)return openAuth();try{const d=await api("/api/buy/"+id,{method:"POST",headers:{"Content-Type":"application/json"}});toast("Achat confirmé #"+d.orderId);loadProducts();loadOrders();loadMe()}catch(e){toast(e.message)}}
-function showPage(id){document.querySelectorAll(".page").forEach(x=>x.classList.remove("active"));$(id).classList.add("active");if(id==="orders")loadOrders();if(id==="wallet")loadMe();if(id==="sell"&&!token)openAuth()}
-function openAuth(){ $("authModal").classList.remove("hidden"); $("authMsg").textContent=""}
-function closeAuth(){ $("authModal").classList.add("hidden")}
-function toggleAuth(){register=!register;$("authTitle").textContent=register?"Créer un compte":"Connexion";$("authName").style.display=register?"block":"none";$("authSwitch").innerHTML=register?'Déjà un compte ? <a onclick="toggleAuth()">Se connecter</a>':'Pas encore de compte ? <a onclick="toggleAuth()">Créer un compte</a>'}
-$("authForm").onsubmit=async e=>{e.preventDefault();try{const body={email:$("authEmail").value,password:$("authPassword").value};if(register)body.name=$("authName").value;const d=await api(register?"/api/register":"/api/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});token=d.token;localStorage.setItem("token",token);closeAuth();updateAccount();loadMe();toast("Bienvenue !")}catch(e){$("authMsg").textContent=e.message}}
-$("sellForm").onsubmit=async e=>{e.preventDefault();if(!token)return openAuth();try{const r=await fetch("/api/products",{method:"POST",headers:{Authorization:"Bearer "+token},body:new FormData(e.target)});const d=await r.json();if(!r.ok)throw Error(d.error);e.target.reset();toast("Annonce publiée !");showPage("home");loadProducts()}catch(err){toast(err.message)}}
-$("creditForm").onsubmit=async e=>{e.preventDefault();try{await api("/api/wallet/demo-credit",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({amount:e.target.amount.value})});e.target.reset();loadMe();toast("Crédit ajouté (démo)")}catch(err){toast(err.message)}}
-async function loadMe(){if(!token)return;$("balance").textContent="…";try{const u=await api("/api/me");$("balance").textContent=money(u.wallet_cents)}catch{localStorage.removeItem("token");token="";updateAccount()}}
-async function loadOrders(){if(!token){$("ordersList").innerHTML="<p>Connecte-toi pour voir tes commandes.</p>";return}try{const rows=await api("/api/orders");$("ordersList").innerHTML=rows.length?rows.map(o=>`<div class="order"><b>${esc(o.title)}</b><br>${money(o.amount_cents)} · ${o.status}</div>`).join(""):"<p>Aucune commande.</p>"}catch(e){$("ordersList").textContent=e.message}}
-function updateAccount(){ $("accountBtn").textContent=token?"Mon compte":"Se connecter"; }
-function setLang(l){localStorage.setItem("lang",l);toast(l==="ru"?"Язык: русский":l==="az"?"Dil: Azərbaycan":"Langue : français")}
-updateAccount();loadProducts();if(token)loadMe();''',
-
-"README.md": r'''# Vestiq Marketplace — projet de départ
-
-## Installation
-1. Installe Node.js 18+.
-2. Ouvre un terminal dans ce dossier.
-3. Lance :
-   npm install
-   npm start
-4. Ouvre http://localhost:3000
-
-## Important
-Le paiement inclus ici est volontairement un MODE DÉMO : le portefeuille peut être crédité fictivement et l'achat transfère ce solde entre comptes.
-
-Pour accepter de vrais paiements par carte/PayPal, il faut brancher un prestataire de paiement avec ses clés secrètes côté serveur, vérifier les webhooks et respecter les obligations légales (KYC, remboursements, litiges, fiscalité, protection des données, etc.). Ne mets jamais une clé secrète dans public/app.js.
-
-Le projet est un socle fonctionnel, pas un service financier prêt pour la production.
-'''
+Le paiement inclus est un portefeuille de DEMO. Pour les paiements réels par carte/PayPal, branche un prestataire de paiement côté serveur avec des clés secrètes et des webhooks.'''
 }
-
-for rel, content in files.items():
-    p=root/rel
-    p.parent.mkdir(parents=True,exist_ok=True)
-    p.write_text(content,encoding="utf-8")
-
-zip_path="/mnt/data/vestiq-marketplace.zip"
-with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+for rel,c in files.items():
+    p=root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_text(c,encoding="utf-8")
+zipfile_path="/mnt/data/DadaShop.zip"
+with zipfile.ZipFile(zipfile_path,"w",zipfile.ZIP_DEFLATED) as z:
     for p in root.rglob("*"):
-        if p.is_file():
-            z.write(p,p.relative_to(root))
-zip_path
+        if p.is_file(): z.write(p,p.relative_to(root))
+zipfile_path
